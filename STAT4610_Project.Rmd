@@ -1,0 +1,380 @@
+---
+title: "STAT4610_Project"
+output: html_document
+---
+
+```{r}
+# Read the data sets
+test_data <- read.csv("test.csv")
+train_data <- read.csv("train.csv")
+```
+
+
+```{r}
+head(train_data)
+head(test_data)
+```
+
+
+```{r}
+dim(train_data)
+dim(test_data)
+```
+
+```{r}
+str(train_data)
+
+summary(train_data)
+
+names(train_data)
+```
+
+
+
+
+```{r}
+table(train_data$Y)
+prop.table(table(train_data$Y))
+
+unique(train_data$Y)
+
+colSums(is.na(train_data))
+colSums(is.na(test_data))
+```
+
+```{r}
+calculate_f1 <- function(actual, predicted) {
+  TP <- sum(actual == 1 & predicted == 1)
+  FP <- sum(actual == 0 & predicted == 1)
+  FN <- sum(actual == 1 & predicted == 0)
+
+  precision <- if ((TP + FP) == 0) 0 else TP / (TP + FP)
+  recall <- if ((TP + FN) == 0) 0 else TP / (TP + FN)
+
+  if ((precision + recall) == 0) return(0)
+
+  2 * precision * recall / (precision + recall)
+}
+
+```
+
+
+
+```{r}
+# Install once if needed
+if (!requireNamespace("xgboost", quietly = TRUE)) {
+  install.packages("xgboost")
+}
+
+library(xgboost)
+
+set.seed(4610)
+
+features <- paste0("x", 1:10)
+
+stopifnot(all(features %in% names(train_data)))
+stopifnot(all(features %in% names(test_data)))
+stopifnot("Y" %in% names(train_data))
+stopifnot("ID" %in% names(test_data))
+
+y <- as.integer(as.character(train_data$Y))
+stopifnot(!anyNA(y), all(y %in% c(0L, 1L)))
+
+X_train <- train_data[, features, drop = FALSE]
+X_test <- test_data[, features, drop = FALSE]
+
+for (nm in features) {
+  if (is.factor(X_train[[nm]]) ||
+      is.character(X_train[[nm]]) ||
+      is.factor(X_test[[nm]]) ||
+      is.character(X_test[[nm]])) {
+
+    levels_all <- unique(c(
+      as.character(X_train[[nm]]),
+      as.character(X_test[[nm]])
+    ))
+
+    X_train[[nm]] <- factor(
+      X_train[[nm]], levels = levels_all
+    )
+
+    X_test[[nm]] <- factor(
+      X_test[[nm]], levels = levels_all
+    )
+  }
+}
+
+str(X_train)
+table(y)
+```
+
+
+```{r}
+set.seed(4610)
+
+class_indices <- lapply(
+  split(seq_along(y), y),
+  function(ids) sample(ids, length(ids))
+)
+
+train_idx <- unlist(lapply(class_indices, function(ids) {
+  ids[seq_len(floor(length(ids) * 0.70))]
+}))
+
+tune_idx <- unlist(lapply(class_indices, function(ids) {
+  n <- length(ids)
+  ids[(floor(n * 0.70) + 1):floor(n * 0.85)]
+}))
+
+valid_idx <- setdiff(
+  seq_along(y), c(train_idx, tune_idx)
+)
+
+# XGBoost data objects
+dtrain <- xgb.DMatrix(
+  data = X_train[train_idx, , drop = FALSE],
+  label = y[train_idx]
+)
+
+dtune <- xgb.DMatrix(
+  data = X_train[tune_idx, , drop = FALSE],
+  label = y[tune_idx]
+)
+
+dvalid <- xgb.DMatrix(
+  data = X_train[valid_idx, , drop = FALSE],
+  label = y[valid_idx]
+)
+
+cat("Training:", length(train_idx), "\n")
+cat("Tuning:", length(tune_idx), "\n")
+cat("Validation:", length(valid_idx), "\n")
+
+```
+
+
+```{r}
+# Initial hyperparameter search
+grid <- expand.grid(
+  max_depth = c(3, 5),
+  eta = c(0.03, 0.07)
+)
+
+# Threshold candidates
+thresholds <- seq(0.10, 0.80, by = 0.01)
+
+results <- data.frame()
+models <- list()
+all_threshold_scores <- list()
+
+for (i in seq_len(nrow(grid))) {
+
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "aucpr",
+    tree_method = "hist",
+    max_depth = grid$max_depth[i],
+    eta = grid$eta[i],
+    min_child_weight = 5,
+    subsample = 0.85,
+    colsample_bytree = 0.9,
+    nthread = 2,
+    seed = 4610
+  )
+
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1200,
+    evals = list(tuning = dtune),
+    early_stopping_rounds = 60,
+    verbose = 0
+  )
+
+  # Best iteration is stored with 0-based indexing
+  best_round <- as.integer(
+    xgb.attr(model, "best_iteration")
+  ) + 1L
+
+  # Predict default probabilities
+  prob <- predict(
+    model,
+    dtune,
+    iterationrange = c(1L, best_round)
+  )
+
+  # Find the F1-maximizing threshold
+  scores <- sapply(thresholds, function(t) {
+    predicted <- as.integer(prob >= t)
+    calculate_f1(y[tune_idx], predicted)
+  })
+
+  best_t <- thresholds[which.max(scores)]
+  best_f1 <- max(scores)
+
+  results <- rbind(results, data.frame(
+    model_id = i,
+    max_depth = grid$max_depth[i],
+    eta = grid$eta[i],
+    best_round = best_round,
+    threshold = best_t,
+    tuning_f1 = best_f1
+  ))
+
+  models[[i]] <- model
+  all_threshold_scores[[i]] <- scores
+
+  cat(
+    "Model", i,
+    "| F1:", round(best_f1, 4),
+    "| Threshold:", best_t,
+    "| Rounds:", best_round, "\n"
+  )
+}
+
+
+results <- results[order(-results$tuning_f1), ]
+print(results)
+
+
+```
+
+
+```{r}
+best_id <- results$model_id[1]
+best_threshold <- results$threshold[1]
+best_round <- results$best_round[1]
+
+plot(
+  thresholds,
+  all_threshold_scores[[best_id]],
+  type = "l",
+  lwd = 2,
+  xlab = "Classification Threshold",
+  ylab = "F1 Score",
+  main = "Gradient Boosting: F1 vs Threshold"
+)
+
+abline(v = best_threshold, lty = 2)
+
+cat("Selected threshold:", best_threshold, "\n")
+
+```
+
+```{r}
+best_model <- models[[best_id]]
+
+valid_prob <- predict(
+  best_model,
+  dvalid,
+  iterationrange = c(1L, best_round)
+)
+
+valid_pred <- as.integer(
+  valid_prob >= best_threshold
+)
+
+validation_f1 <- calculate_f1(
+  y[valid_idx],
+  valid_pred
+)
+
+cat("Final Validation F1:", validation_f1, "\n")
+
+# Confusion matrix
+print(table(
+  Actual = y[valid_idx],
+  Predicted = valid_pred
+))
+
+# Additional metrics
+TP <- sum(y[valid_idx] == 1 & valid_pred == 1)
+FP <- sum(y[valid_idx] == 0 & valid_pred == 1)
+FN <- sum(y[valid_idx] == 1 & valid_pred == 0)
+
+precision <- if (TP + FP == 0) 0 else TP / (TP + FP)
+recall <- if (TP + FN == 0) 0 else TP / (TP + FN)
+
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+cat("F1:", validation_f1, "\n")
+
+```
+
+```{r}
+
+importance <- xgb.importance(
+  model = best_model
+)
+
+print(importance)
+
+xgb.plot.importance(
+  importance_matrix = importance
+)
+```
+
+
+```{r}
+# Full training data
+dfull <- xgb.DMatrix(
+  data = X_train,
+  label = y
+)
+
+dtest <- xgb.DMatrix(
+  data = X_test
+)
+
+# Reuse selected hyperparameters
+final_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  tree_method = "hist",
+  max_depth = results$max_depth[1],
+  eta = results$eta[1],
+  min_child_weight = 5,
+  subsample = 0.85,
+  colsample_bytree = 0.9,
+  nthread = 2,
+  seed = 4610
+)
+
+final_model <- xgb.train(
+  params = final_params,
+  data = dfull,
+  nrounds = best_round,
+  verbose = 0
+)
+
+# Predict test probabilities
+test_prob <- predict(final_model, dtest)
+
+# Convert to labels using selected threshold
+test_pred <- as.integer(
+  test_prob >= best_threshold
+)
+
+# Submission data frame
+submission <- data.frame(
+  ID = test_data$ID,
+  Y = test_pred
+)
+
+# Validate submission
+stopifnot(nrow(submission) == nrow(test_data))
+stopifnot(identical(names(submission), c("ID", "Y")))
+stopifnot(all(submission$Y %in% c(0L, 1L)))
+stopifnot(!anyDuplicated(submission$ID))
+
+# Save CSV
+write.csv(
+  submission,
+  "submission.csv",
+  row.names = FALSE
+)
+
+head(submission)
+table(submission$Y)
+
+```
